@@ -1,0 +1,16 @@
+# Normalise line endings in the repository to LF.
+#
+# deploy.sh is scp'd to a Linux host and executed there. If Git stored or checked it out with
+# CRLF, the shebang becomes "/bin/bash\r" and the host reports:
+#     bad interpreter: /bin/bash^M
+# which is a confusing way to discover a line-ending problem mid-deploy.
+* text=auto eol=lf
+
+# Windows-only scripts genuinely want CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch these.
+*.png binary
+*.jpg binary
+*.ico binary
