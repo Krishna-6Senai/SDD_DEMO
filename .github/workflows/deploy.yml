@@ -143,10 +143,15 @@ jobs:
         env:
           IMAGE: ${{ needs.build.outputs.image }}
         # P-5. The deploy step's exit code is not the evidence; this is.
+        #
+        # .Config.Image on the container is the reference it was started with, which deploy.sh
+        # passes as repo@sha256:... — exactly what we want to compare. (.RepoDigests belongs to an
+        # *image*, not a container, so asking a container for it yields an empty string and this
+        # check fails even on a perfectly good deploy.)
         run: |
           running=$(ssh -i ~/.ssh/id_ed25519 \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-            "docker inspect --format '{{index .RepoDigests 0}}' timeoff-app 2>/dev/null || echo none")
+            "docker inspect --format '{{.Config.Image}}' timeoff-app 2>/dev/null || echo none")
           echo "expected: ${IMAGE}"
           echo "running:  ${running}"
           case "${running}" in
