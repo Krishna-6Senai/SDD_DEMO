@@ -1,0 +1,20 @@
+# Build output
+frontend/dist/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+backend/target/
+
+# Secrets never belong in the repository. The deploy key lives in GitHub repository
+# secrets and in the operator's ~/.ssh — never here. The .pub counterpart is safe.
+*.pem
+*.key
+id_ed25519
+timeoff_deploy
+.env
+.env.*
+
+# Tooling
+.idea/
+.vscode/
+*.iml
+.DS_Store

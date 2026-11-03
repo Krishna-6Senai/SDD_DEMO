@@ -1,0 +1,156 @@
+name: Build and deploy
+
+# Phase 0b. Build once in CI, publish an image, deploy it by reference over SSH.
+#
+# Three rules from spec/CICD.md that this workflow exists to honour:
+#   P-1  build once, promote a digest — nothing is ever built on the server
+#   P-2  a gate that cannot fail is not a gate — tests block the deploy
+#   P-5  a deploy is verified by the running system, not by an exit code
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Two deploys racing onto one container leaves whichever finished last, which is not necessarily
+  # the newer commit.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------- validate
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend typecheck and build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Frontend tests
+        working-directory: frontend
+        # No `continue-on-error`. If there are no tests yet the script exits 0; once there are
+        # tests, a failure stops the deploy.
+        run: npm test --if-present
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Backend tests
+        working-directory: backend
+        run: mvn -B verify
+
+  # ---------------------------------------------------------------- build
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Tagged by commit, never `latest`. A release is a specific artefact.
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve the digest
+        id: ref
+        run: |
+          echo "image=${IMAGE_NAME}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          echo "Built ${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+
+  # ---------------------------------------------------------------- deploy
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: development
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write the deploy key
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Ship the deploy script
+        run: |
+          scp -i ~/.ssh/id_ed25519 deploy/deploy.sh \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/timeoff/deploy.sh"
+          ssh -i ~/.ssh/id_ed25519 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "chmod +x /opt/timeoff/deploy.sh"
+
+      - name: Deploy
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        # The registry token is piped over stdin rather than passed as an argument, so it does not
+        # appear in the server's process list. It expires when this job ends.
+        run: |
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | ssh -i ~/.ssh/id_ed25519 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "docker login ghcr.io -u '${{ github.actor }}' --password-stdin \
+             && /opt/timeoff/deploy.sh '${IMAGE}' \
+             && docker logout ghcr.io"
+
+      - name: Verify what is actually running
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        # P-5. The deploy step's exit code is not the evidence; this is.
+        run: |
+          running=$(ssh -i ~/.ssh/id_ed25519 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "docker inspect --format '{{index .RepoDigests 0}}' timeoff-app 2>/dev/null || echo none")
+          echo "expected: ${IMAGE}"
+          echo "running:  ${running}"
+          case "${running}" in
+            *"${IMAGE##*@}"*) echo "digest matches" ;;
+            *) echo "::error::the running image is not the one this run built"; exit 1 ;;
+          esac
+
+      - name: Reachable from outside
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "http://${{ secrets.SSH_HOST }}:8700/" || echo 000)
+          echo "http://${{ secrets.SSH_HOST }}:8700/ -> ${code}"
+          [ "${code}" = "200" ] || { echo "::error::app not reachable"; exit 1; }

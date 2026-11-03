@@ -1,0 +1,11 @@
+# Keep the build context small and deterministic: anything the Dockerfile builds itself must not
+# be copied in from the host, or a stale local artefact can end up in the image.
+.git
+.github
+**/node_modules
+**/dist
+**/target
+*.md
+deploy
+.gitignore
+.dockerignore
